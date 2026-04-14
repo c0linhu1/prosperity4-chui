@@ -55,13 +55,10 @@ logger = Logger()
 
 
 class Trader:
-    prev_osm_mid = None
 
     def trade_osmium(self, state: TradingState) -> List[Order]:
-        """Mean reverting around 10000 with strong -0.49 lag-1 autocorrelation."""
         product = "ASH_COATED_OSMIUM"
         limit = 80
-        fair = 10000
         od = state.order_depths.get(product)
         if not od:
             return []
@@ -69,69 +66,59 @@ class Trader:
         orders = []
         pos = state.position.get(product, 0)
 
-        best_bid = max(od.buy_orders.keys()) if od.buy_orders else fair - 10
-        best_ask = min(od.sell_orders.keys()) if od.sell_orders else fair + 10
+        best_bid = max(od.buy_orders.keys()) if od.buy_orders else 9990
+        best_ask = min(od.sell_orders.keys()) if od.sell_orders else 10010
         mid = (best_bid + best_ask) / 2
 
-        # Mean reversion signal: if price just went up, lean short. Vice versa.
-        signal = 0
-        if self.prev_osm_mid is not None:
-            diff = mid - self.prev_osm_mid
-            if diff > 2:
-                signal = -1  # price went up, expect it to come back down
-            elif diff < -2:
-                signal = 1   # price went down, expect it to come back up
-        self.prev_osm_mid = mid
+        # Use wall mid as fair value — find level with biggest volume each side
+        if od.buy_orders:
+            wall_bid = max(od.buy_orders.keys(), key=lambda p: od.buy_orders[p])
+        else:
+            wall_bid = best_bid
+        if od.sell_orders:
+            wall_ask = min(od.sell_orders.keys(), key=lambda p: -od.sell_orders[p])
+        else:
+            wall_ask = best_ask
+        fair = (wall_bid + wall_ask) / 2
 
-        # Adjust fair value based on signal
-        adjusted_fair = fair + signal * 3
-
-        # Take everything below adjusted fair
+        # Take below fair
         for price in sorted(od.sell_orders.keys()):
-            if price < adjusted_fair:
+            if price < fair:
                 qty = min(-od.sell_orders[price], limit - pos)
                 if qty > 0:
                     orders.append(Order(product, price, qty))
                     pos += qty
 
-        # Sell everything above adjusted fair
+        # Sell above fair
         for price in sorted(od.buy_orders.keys(), reverse=True):
-            if price > adjusted_fair:
+            if price > fair:
                 qty = min(od.buy_orders[price], limit + pos)
                 if qty > 0:
                     orders.append(Order(product, price, -qty))
                     pos -= qty
 
-        # Flatten at fair
-        if fair in od.sell_orders and pos < 0:
-            qty = min(-od.sell_orders[fair], -pos)
+        # Flatten at fair (round to int)
+        fair_int = round(fair)
+        if fair_int in od.sell_orders and pos < 0:
+            qty = min(-od.sell_orders[fair_int], -pos)
             if qty > 0:
-                orders.append(Order(product, fair, qty))
+                orders.append(Order(product, fair_int, qty))
                 pos += qty
-        if fair in od.buy_orders and pos > 0:
-            qty = min(od.buy_orders[fair], pos)
+        if fair_int in od.buy_orders and pos > 0:
+            qty = min(od.buy_orders[fair_int], pos)
             if qty > 0:
-                orders.append(Order(product, fair, -qty))
+                orders.append(Order(product, fair_int, -qty))
                 pos -= qty
 
-        # Passive quotes — skew based on signal
-        buy_price = best_bid + 1
-        sell_price = best_ask - 1
-
-        if signal == 1:   # expect up, buy more aggressively
-            buy_price = best_bid + 2
-        elif signal == -1: # expect down, sell more aggressively
-            sell_price = best_ask - 2
-
+        # Passive quotes at best+1 with full remaining capacity
         if limit - pos > 0:
-            orders.append(Order(product, buy_price, limit - pos))
+            orders.append(Order(product, best_bid + 1, limit - pos))
         if limit + pos > 0:
-            orders.append(Order(product, sell_price, -(limit + pos)))
+            orders.append(Order(product, best_ask - 1, -(limit + pos)))
 
         return orders
 
     def trade_pepper(self, state: TradingState) -> List[Order]:
-        """Strong +1/tick drift. Buy and hold max position."""
         product = "INTARIAN_PEPPER_ROOT"
         limit = 80
         od = state.order_depths.get(product)
@@ -144,16 +131,18 @@ class Trader:
         best_bid = max(od.buy_orders.keys()) if od.buy_orders else 0
         best_ask = min(od.sell_orders.keys()) if od.sell_orders else 999999
 
-        # Buy all available asks
+        # Take ALL available asks — drift makes every buy profitable
         for price in sorted(od.sell_orders.keys()):
             qty = min(-od.sell_orders[price], limit - pos)
             if qty > 0:
                 orders.append(Order(product, price, qty))
                 pos += qty
 
-        # Post aggressive buy for remaining capacity
+        # Post aggressive buy for remaining — match best ask to fill fast
+        # Paying 1 extra to fill immediately is worth it vs waiting
+        # (drift earns 80/tick when at max pos, losing 1 per fill is nothing)
         if limit - pos > 0:
-            orders.append(Order(product, best_bid + 1, limit - pos))
+            orders.append(Order(product, best_ask, limit - pos))
 
         return orders
 
