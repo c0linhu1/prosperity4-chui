@@ -53,7 +53,7 @@ class Logger:
 
 logger = Logger()
 
-# market make around fixed fair value
+# mean reversion and drifting - use wall mid as fair value 
 class Trader:
 
     def trade_osmium(self, state: TradingState) -> List[Order]:
