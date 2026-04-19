@@ -56,10 +56,13 @@ logger = Logger()
 
 class Trader:
 
+    def bid(self):
+        return 250
+
     def trade_osmium(self, state: TradingState) -> List[Order]:
+        """TAKE-ONLY Osmium: no passive quotes, only take when edge exists"""
         product = "ASH_COATED_OSMIUM"
         limit = 80
-        fair = 10000
         od = state.order_depths.get(product)
         if not od:
             return []
@@ -67,47 +70,53 @@ class Trader:
         orders = []
         pos = state.position.get(product, 0)
 
-        # Phase 1: Take below fair, sell above fair (same as always)
-        for price in sorted(od.sell_orders.keys()):
-            if price < fair:
-                qty = min(-od.sell_orders[price], limit - pos)
-                if qty > 0:
-                    orders.append(Order(product, price, qty))
-                    pos += qty
+        # Wall mid fair value
+        if od.buy_orders:
+            wall_bid = max(od.buy_orders.keys(), key=lambda p: od.buy_orders[p])
+        else:
+            wall_bid = max(od.buy_orders.keys()) if od.buy_orders else 9992
+        if od.sell_orders:
+            wall_ask = min(od.sell_orders.keys(), key=lambda p: -od.sell_orders[p])
+        else:
+            wall_ask = min(od.sell_orders.keys()) if od.sell_orders else 10008
+        fair = (wall_bid + wall_ask) / 2
 
-        for price in sorted(od.buy_orders.keys(), reverse=True):
-            if price > fair:
-                qty = min(od.buy_orders[price], limit + pos)
-                if qty > 0:
-                    orders.append(Order(product, price, -qty))
-                    pos -= qty
+        # ONLY take — buy below fair, sell above fair
+        if od.sell_orders:
+            for price in sorted(od.sell_orders.keys()):
+                if price < fair:
+                    qty = min(-od.sell_orders[price], limit - pos)
+                    if qty > 0:
+                        orders.append(Order(product, price, qty))
+                        pos += qty
 
-        # Phase 2: Multi-level passive quoting
-        # Spread orders across multiple price levels to catch more takers
-        remaining_buy = limit - pos
-        remaining_sell = limit + pos
+        if od.buy_orders:
+            for price in sorted(od.buy_orders.keys(), reverse=True):
+                if price > fair:
+                    qty = min(od.buy_orders[price], limit + pos)
+                    if qty > 0:
+                        orders.append(Order(product, price, -qty))
+                        pos -= qty
 
-        buy_levels = [fair - 1, fair - 3, fair - 5, fair - 7]
-        sell_levels = [fair + 1, fair + 3, fair + 5, fair + 7]
-
-        per_level_buy = max(1, remaining_buy // len(buy_levels))
-        per_level_sell = max(1, remaining_sell // len(sell_levels))
-
-        for price in buy_levels:
-            qty = min(per_level_buy, remaining_buy)
+        # Flatten at fair
+        fair_int = round(fair)
+        if od.sell_orders and fair_int in od.sell_orders and pos < 0:
+            qty = min(-od.sell_orders[fair_int], -pos)
             if qty > 0:
-                orders.append(Order(product, price, qty))
-                remaining_buy -= qty
-
-        for price in sell_levels:
-            qty = min(per_level_sell, remaining_sell)
+                orders.append(Order(product, fair_int, qty))
+                pos += qty
+        if od.buy_orders and fair_int in od.buy_orders and pos > 0:
+            qty = min(od.buy_orders[fair_int], pos)
             if qty > 0:
-                orders.append(Order(product, price, -qty))
-                remaining_sell -= qty
+                orders.append(Order(product, fair_int, -qty))
+                pos -= qty
+
+        # NO passive quotes — done
 
         return orders
 
     def trade_pepper(self, state: TradingState) -> List[Order]:
+        """Smart Pepper: take level 1 only + post remaining at mid"""
         product = "INTARIAN_PEPPER_ROOT"
         limit = 80
         od = state.order_depths.get(product)
@@ -115,86 +124,23 @@ class Trader:
             return []
         orders = []
         pos = state.position.get(product, 0)
-        best_bid = max(od.buy_orders.keys()) if od.buy_orders else 0
-        for price in sorted(od.sell_orders.keys()):
-            qty = min(-od.sell_orders[price], limit - pos)
+        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
+        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
+        if od.sell_orders:
+            best_ask_price = min(od.sell_orders.keys())
+            ask_vol = -od.sell_orders[best_ask_price]
+            qty = min(ask_vol, limit - pos)
             if qty > 0:
-                orders.append(Order(product, price, qty))
+                orders.append(Order(product, best_ask_price, qty))
                 pos += qty
         if limit - pos > 0:
-            orders.append(Order(product, best_bid + 1, limit - pos))
-        return orders
-
-    def trade_emeralds(self, state: TradingState) -> List[Order]:
-        product = "EMERALDS"
-        limit = 80
-        fair = 10000
-        od = state.order_depths.get(product)
-        if not od:
-            return []
-        orders = []
-        pos = state.position.get(product, 0)
-        for price in sorted(od.sell_orders.keys()):
-            if price < fair:
-                qty = min(-od.sell_orders[price], limit - pos)
-                if qty > 0:
-                    orders.append(Order(product, price, qty))
-                    pos += qty
-        for price in sorted(od.buy_orders.keys(), reverse=True):
-            if price > fair:
-                qty = min(od.buy_orders[price], limit + pos)
-                if qty > 0:
-                    orders.append(Order(product, price, -qty))
-                    pos -= qty
-        if fair in od.sell_orders and pos < 0:
-            qty = min(-od.sell_orders[fair], -pos)
-            if qty > 0:
-                orders.append(Order(product, fair, qty))
-                pos += qty
-        if fair in od.buy_orders and pos > 0:
-            qty = min(od.buy_orders[fair], pos)
-            if qty > 0:
-                orders.append(Order(product, fair, -qty))
-                pos -= qty
-        best_bid = max(od.buy_orders.keys()) if od.buy_orders else fair - 10
-        best_ask = min(od.sell_orders.keys()) if od.sell_orders else fair + 10
-        if limit - pos > 0:
-            orders.append(Order(product, best_bid + 1, limit - pos))
-        if limit + pos > 0:
-            orders.append(Order(product, best_ask - 1, -(limit + pos)))
-        return orders
-
-    def trade_tomatoes(self, state: TradingState) -> List[Order]:
-        product = "TOMATOES"
-        limit = 80
-        od = state.order_depths.get(product)
-        if not od or not od.buy_orders or not od.sell_orders:
-            return []
-        orders = []
-        pos = state.position.get(product, 0)
-        best_bid = max(od.buy_orders.keys())
-        best_ask = min(od.sell_orders.keys())
-        mid = (best_bid + best_ask) / 2
-        for price in sorted(od.sell_orders.keys()):
-            if price < mid:
-                qty = min(-od.sell_orders[price], limit - pos)
-                if qty > 0:
-                    orders.append(Order(product, price, qty))
-                    pos += qty
-        for price in sorted(od.buy_orders.keys(), reverse=True):
-            if price > mid:
-                qty = min(od.buy_orders[price], limit + pos)
-                if qty > 0:
-                    orders.append(Order(product, price, -qty))
-                    pos -= qty
-        spread = best_ask - best_bid
-        if spread > 2:
-            buy_size = min(10, limit - pos)
-            sell_size = min(10, limit + pos)
-            if buy_size > 0:
-                orders.append(Order(product, best_bid + 1, buy_size))
-            if sell_size > 0:
-                orders.append(Order(product, best_ask - 1, -sell_size))
+            if best_bid is not None and best_ask is not None:
+                mid = (best_bid + best_ask) // 2
+                orders.append(Order(product, mid + 1, limit - pos))
+            elif best_ask is not None:
+                orders.append(Order(product, best_ask - 4, limit - pos))
+            elif best_bid is not None:
+                orders.append(Order(product, best_bid + 1, limit - pos))
         return orders
 
     def run(self, state: TradingState):
@@ -203,10 +149,6 @@ class Trader:
             result["ASH_COATED_OSMIUM"] = self.trade_osmium(state)
         if "INTARIAN_PEPPER_ROOT" in state.order_depths:
             result["INTARIAN_PEPPER_ROOT"] = self.trade_pepper(state)
-        if "EMERALDS" in state.order_depths:
-            result["EMERALDS"] = self.trade_emeralds(state)
-        if "TOMATOES" in state.order_depths:
-            result["TOMATOES"] = self.trade_tomatoes(state)
         for product in state.order_depths:
             if product not in result:
                 result[product] = []

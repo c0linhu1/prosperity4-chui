@@ -57,10 +57,6 @@ logger = Logger()
 class Trader:
 
     def bid(self):
-        # Market Access Fee: blind auction, top 50% get extra 25% order flow.
-        # Fee is one-time, only paid if accepted.
-        # Extra flow is worth ~3-10K XIRECs over the round.
-        # Bid enough to be safely above median, but not wasteful.
         return 250
 
     def trade_osmium(self, state: TradingState) -> List[Order]:
@@ -79,8 +75,6 @@ class Trader:
         if best_bid is None and best_ask is None:
             return []
 
-        # Wall mid fair value: use level with biggest volume on each side
-        # The "wall" is the deep liquidity level posted by the market maker bot
         if od.buy_orders:
             wall_bid = max(od.buy_orders.keys(), key=lambda p: od.buy_orders[p])
         else:
@@ -91,7 +85,6 @@ class Trader:
             wall_ask = best_ask if best_ask else 10008
         fair = (wall_bid + wall_ask) / 2
 
-        # Phase 1: Take any orders below/above fair value (immediate edge)
         if od.sell_orders:
             for price in sorted(od.sell_orders.keys()):
                 if price < fair:
@@ -108,7 +101,6 @@ class Trader:
                         orders.append(Order(product, price, -qty))
                         pos -= qty
 
-        # Phase 2: Flatten inventory at fair value if possible
         fair_int = round(fair)
         if od.sell_orders and fair_int in od.sell_orders and pos < 0:
             qty = min(-od.sell_orders[fair_int], -pos)
@@ -121,11 +113,8 @@ class Trader:
                 orders.append(Order(product, fair_int, -qty))
                 pos -= qty
 
-        # Phase 3: Passive quotes to capture future taker flow
-        # Quote at best+1 to be top of book when takers arrive after us
         if best_bid is not None and limit - pos > 0:
             buy_price = best_bid + 1
-            # Don't buy above fair (negative edge)
             if buy_price < fair:
                 orders.append(Order(product, buy_price, limit - pos))
             elif best_bid < fair:
@@ -133,7 +122,6 @@ class Trader:
 
         if best_ask is not None and limit + pos > 0:
             sell_price = best_ask - 1
-            # Don't sell below fair (negative edge)
             if sell_price > fair:
                 orders.append(Order(product, sell_price, -(limit + pos)))
             elif best_ask > fair:
@@ -142,6 +130,7 @@ class Trader:
         return orders
 
     def trade_pepper(self, state: TradingState) -> List[Order]:
+        """Smart Pepper: take level 1 only + post remaining at mid price"""
         product = "INTARIAN_PEPPER_ROOT"
         limit = 80
         od = state.order_depths.get(product)
@@ -151,27 +140,32 @@ class Trader:
         orders = []
         pos = state.position.get(product, 0)
 
-        # Drift is +0.1/tick = +1000/day, extremely consistent
-        # Optimal strategy: buy everything, never sell, ride the drift
-        # At max position (80), we earn 80 * 0.1 = 8 per tick = 80K per day
+        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
+        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
 
-        # Take ALL available asks — every buy is profitable due to drift
+        # Take ONLY the best ask level (level 1)
+        # This gives instant fills at the tightest spread
+        # Skip deeper levels to reduce spread cost / drawdown
         if od.sell_orders:
-            for price in sorted(od.sell_orders.keys()):
-                qty = min(-od.sell_orders[price], limit - pos)
-                if qty > 0:
-                    orders.append(Order(product, price, qty))
-                    pos += qty
+            best_ask_price = min(od.sell_orders.keys())
+            ask_vol = -od.sell_orders[best_ask_price]
+            qty = min(ask_vol, limit - pos)
+            if qty > 0:
+                orders.append(Order(product, best_ask_price, qty))
+                pos += qty
 
-        # Post aggressive buy at best ask to fill remaining capacity ASAP
-        # Paying the spread is trivial vs drift earnings
+        # Post remaining at mid price (between bid and ask)
+        # More aggressive than best_bid+1 but cheaper than best_ask
         if limit - pos > 0:
-            if od.sell_orders:
-                best_ask = min(od.sell_orders.keys())
-                orders.append(Order(product, best_ask, limit - pos))
-            elif od.buy_orders:
-                best_bid = max(od.buy_orders.keys())
-                # Post above best bid to attract fills
+            if best_bid is not None and best_ask is not None:
+                mid = (best_bid + best_ask) // 2
+                # Post at mid or mid+1 to be aggressive
+                post_price = mid + 1
+                orders.append(Order(product, post_price, limit - pos))
+            elif best_ask is not None:
+                # No bid visible, post at ask - half typical spread
+                orders.append(Order(product, best_ask - 4, limit - pos))
+            elif best_bid is not None:
                 orders.append(Order(product, best_bid + 1, limit - pos))
 
         return orders
@@ -184,7 +178,6 @@ class Trader:
         if "INTARIAN_PEPPER_ROOT" in state.order_depths:
             result["INTARIAN_PEPPER_ROOT"] = self.trade_pepper(state)
 
-        # Handle any other products that might appear (future rounds)
         for product in state.order_depths:
             if product not in result:
                 result[product] = []
