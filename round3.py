@@ -1,7 +1,10 @@
 import json
 import math
 from datamodel import OrderDepth, TradingState, Order, Listing, Observation, ProsperityEncoder, Symbol, Trade
-from typing import Any, List, Dict, Tuple
+from typing import Any, List
+from statistics import NormalDist
+
+_N = NormalDist()
 
 class Logger:
     def __init__(self) -> None:
@@ -19,358 +22,331 @@ class Logger:
             self.truncate(self.logs, max_item_length),
         ]))
         self.logs = ""
-    def compress_state(self, state, trader_data):
-        return [state.timestamp, trader_data, self.compress_listings(state.listings),
+    def compress_state(self, state, td):
+        return [state.timestamp, td, self.compress_listings(state.listings),
                 self.compress_order_depths(state.order_depths), self.compress_trades(state.own_trades),
                 self.compress_trades(state.market_trades), state.position,
                 self.compress_observations(state.observations)]
-    def compress_listings(self, listings):
-        return [[l.symbol, l.product, l.denomination] for l in listings.values()]
-    def compress_order_depths(self, order_depths):
-        return {s: [od.buy_orders, od.sell_orders] for s, od in order_depths.items()}
-    def compress_trades(self, trades):
-        compressed = []
-        for arr in trades.values():
-            for t in arr:
-                compressed.append([t.symbol, t.price, t.quantity, t.buyer, t.seller, t.timestamp])
-        return compressed
-    def compress_observations(self, observations):
+    def compress_listings(self, l): return [[x.symbol, x.product, x.denomination] for x in l.values()]
+    def compress_order_depths(self, od): return {s: [o.buy_orders, o.sell_orders] for s, o in od.items()}
+    def compress_trades(self, t):
+        c = []
+        for a in t.values():
+            for x in a: c.append([x.symbol, x.price, x.quantity, x.buyer, x.seller, x.timestamp])
+        return c
+    def compress_observations(self, o):
         co = {}
-        for p, o in observations.conversionObservations.items():
-            co[p] = [o.bidPrice, o.askPrice, o.transportFees, o.exportTariff, o.importTariff, o.sugarPrice, o.sunlightIndex]
-        return [observations.plainValueObservations, co]
-    def compress_orders(self, orders):
-        compressed = []
-        for arr in orders.values():
-            for o in arr:
-                compressed.append([o.symbol, o.price, o.quantity])
-        return compressed
-    def to_json(self, value):
-        return json.dumps(value, cls=ProsperityEncoder, separators=(",", ":"))
-    def truncate(self, value, max_length):
-        if len(value) <= max_length:
-            return value
-        return value[:max_length - 3] + "..."
+        for p, x in o.conversionObservations.items():
+            co[p] = [x.bidPrice, x.askPrice, x.transportFees, x.exportTariff, x.importTariff, x.sugarPrice, x.sunlightIndex]
+        return [o.plainValueObservations, co]
+    def compress_orders(self, o):
+        c = []
+        for a in o.values():
+            for x in a: c.append([x.symbol, x.price, x.quantity])
+        return c
+    def to_json(self, v): return json.dumps(v, cls=ProsperityEncoder, separators=(",", ":"))
+    def truncate(self, v, m): return v if len(v) <= m else v[:m-3] + "..."
 
 logger = Logger()
 
-# ============================================================
-# BLACK-SCHOLES
-# ============================================================
-def norm_cdf(x):
-    return 0.5 * math.erfc(-x / math.sqrt(2))
+HP_LIMIT = 200
+VE_LIMIT = 200
+VEV_LIMIT = 300
+TAKE_CAP = 60
+TTE_DAYS = 5
+IV_WINDOW = 20
 
-def bs_call(S, K, T, sigma):
-    if T <= 1e-8 or sigma <= 1e-8:
-        return max(0.0, S - K)
-    d1 = (math.log(S / K) + 0.5 * sigma * sigma * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    return S * norm_cdf(d1) - K * norm_cdf(d2)
 
-def bs_delta(S, K, T, sigma):
-    if T <= 1e-8 or sigma <= 1e-8:
-        return 1.0 if S > K else 0.0
-    d1 = (math.log(S / K) + 0.5 * sigma * sigma * T) / (sigma * math.sqrt(T))
-    return norm_cdf(d1)
+def _d1(S, K, T, sig):
+    return (math.log(S/K) + 0.5*sig*sig*T) / (sig*math.sqrt(T))
 
-def implied_vol(price, S, K, T):
-    """Newton's method for IV"""
-    if T <= 1e-8 or price <= max(0, S - K) + 0.01:
-        return None
-    sigma = 0.25  # initial guess
-    for _ in range(50):
-        p = bs_call(S, K, T, sigma)
-        d1 = (math.log(S / K) + 0.5 * sigma * sigma * T) / (sigma * math.sqrt(T))
-        vega = S * math.sqrt(T) * math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi)
-        if vega < 1e-10:
-            break
-        sigma = sigma - (p - price) / vega
-        if sigma <= 0.001:
-            sigma = 0.001
-    return sigma if 0.01 < sigma < 5.0 else None
+def bs_call(S, K, T, sig):
+    if T <= 1e-6 or sig <= 0 or S <= 0: return max(S-K, 0.0)
+    d1 = _d1(S, K, T, sig)
+    return S*_N.cdf(d1) - K*_N.cdf(d1-sig*math.sqrt(T))
 
-VOUCHER_STRIKES = {
-    "VEV_4000": 4000, "VEV_4500": 4500,
-    "VEV_5000": 5000, "VEV_5100": 5100,
-    "VEV_5200": 5200, "VEV_5300": 5300,
-    "VEV_5400": 5400, "VEV_5500": 5500,
-    "VEV_6000": 6000, "VEV_6500": 6500,
-}
+def bs_vega(S, K, T, sig):
+    if T <= 1e-6 or sig <= 0 or S <= 0: return 0.0
+    return S*_N.pdf(_d1(S, K, T, sig))*math.sqrt(T)
 
-# ATM strikes used for TTE inference and smile fitting
-ATM_STRIKES = [5000, 5100, 5200, 5300, 5400, 5500]
+def iv_newton(S, K, T, mp, init=0.265):
+    sig = init
+    for _ in range(5):
+        p = bs_call(S, K, T, sig)
+        v = bs_vega(S, K, T, sig)
+        if v < 1e-10: break
+        sig -= (p - mp) / v
+        sig = max(0.01, min(sig, 2.0))
+    return sig
 
 
 class Trader:
+    def get_mid(self, od):
+        bb = max(od.buy_orders.keys()) if od.buy_orders else None
+        ba = min(od.sell_orders.keys()) if od.sell_orders else None
+        if bb is not None and ba is not None: return (bb+ba)/2, bb, ba
+        return None, bb, ba
 
-    def get_mid(self, od: OrderDepth):
-        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
-        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
-        if best_bid and best_ask:
-            return (best_bid + best_ask) / 2, best_bid, best_ask
-        return None, best_bid, best_ask
+    def get_wall_mid(self, od):
+        bb = max(od.buy_orders.keys()) if od.buy_orders else None
+        ba = min(od.sell_orders.keys()) if od.sell_orders else None
+        if bb is None or ba is None: return None, bb, ba
+        wb = max(od.buy_orders.keys(), key=lambda p: od.buy_orders[p])
+        wa = min(od.sell_orders.keys(), key=lambda p: -od.sell_orders[p])
+        return (wb+wa)/2, bb, ba
 
-    def get_wall_mid(self, od: OrderDepth):
-        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
-        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
-        if best_bid is None and best_ask is None:
-            return None, None, None
-        if od.buy_orders:
-            wall_bid = max(od.buy_orders.keys(), key=lambda p: od.buy_orders[p])
-        else:
-            wall_bid = best_bid
-        if od.sell_orders:
-            wall_ask = min(od.sell_orders.keys(), key=lambda p: -od.sell_orders[p])
-        else:
-            wall_ask = best_ask
-        if wall_bid is not None and wall_ask is not None:
-            fair = (wall_bid + wall_ask) / 2
-        elif wall_bid is not None:
-            fair = wall_bid + 8
-        else:
-            fair = wall_ask - 8
-        return fair, best_bid, best_ask
-
-    def infer_tte_and_smile(self, state: TradingState) -> Tuple[float, Dict[int, float]]:
-        """Infer TTE from option prices and fit volatility smile.
-        Returns (T_annual, {strike: fair_iv})"""
-        
-        # Get VE underlying price
-        ve_od = state.order_depths.get("VELVETFRUIT_EXTRACT")
-        if not ve_od:
-            return 5.0 / 365.0, {}
-        ve_mid, _, _ = self.get_mid(ve_od)
-        if not ve_mid:
-            return 5.0 / 365.0, {}
-        S = ve_mid
-
-        # Collect market mids for ATM options
-        option_mids = {}
-        for strike in ATM_STRIKES:
-            prod = f"VEV_{strike}"
-            od = state.order_depths.get(prod)
-            if od:
-                mid, _, _ = self.get_mid(od)
-                if mid and mid > 0.5:
-                    option_mids[strike] = mid
-
-        if len(option_mids) < 3:
-            return 5.0 / 365.0, {}
-
-        # Find TTE that makes average ATM IV closest to 0.23
-        best_T = 5.0 / 365.0
-        best_err = 999
-        for tte_days_x10 in range(30, 80):  # 3.0 to 8.0 days
-            T = (tte_days_x10 / 10.0) / 365.0
-            ivs = []
-            for strike, market_mid in option_mids.items():
-                iv = implied_vol(market_mid, S, strike, T)
-                if iv:
-                    ivs.append(iv)
-            if len(ivs) >= 3:
-                avg_iv = sum(ivs) / len(ivs)
-                err = abs(avg_iv - 0.23)
-                if err < best_err:
-                    best_err = err
-                    best_T = T
-
-        # Now compute IV for all strikes at inferred TTE
-        T = best_T
-        strike_ivs = {}
-        for strike in VOUCHER_STRIKES.values():
-            prod = f"VEV_{strike}"
-            od = state.order_depths.get(prod)
-            if od:
-                mid, _, _ = self.get_mid(od)
-                if mid and mid > 0.5:
-                    iv = implied_vol(mid, S, strike, T)
-                    if iv:
-                        strike_ivs[strike] = iv
-
-        # Fit simple smile: use average of ATM IVs as baseline
-        # For strikes without good IV, use 0.23
-        for strike in VOUCHER_STRIKES.values():
-            if strike not in strike_ivs:
-                strike_ivs[strike] = 0.23
-
-        return T, strike_ivs
-
-    def trade_hydrogel(self, state: TradingState) -> List[Order]:
-        product = "HYDROGEL_PACK"
-        limit = 200
-        od = state.order_depths.get(product)
-        if not od:
-            return []
-        fair, best_bid, best_ask = self.get_wall_mid(od)
-        if fair is None:
-            return []
-        orders = []
-        pos = state.position.get(product, 0)
-
-        # Take level 1 only (smart fill approach)
-        if od.sell_orders:
-            best_ask_price = min(od.sell_orders.keys())
-            if best_ask_price < fair:
-                qty = min(-od.sell_orders[best_ask_price], limit - pos)
-                if qty > 0:
-                    orders.append(Order(product, best_ask_price, qty))
-                    pos += qty
-
-        if od.buy_orders:
-            best_bid_price = max(od.buy_orders.keys())
-            if best_bid_price > fair:
-                qty = min(od.buy_orders[best_bid_price], limit + pos)
-                if qty > 0:
-                    orders.append(Order(product, best_bid_price, -qty))
-                    pos -= qty
-
-        # Flatten at fair
-        fair_int = round(fair)
-        if od.sell_orders and fair_int in od.sell_orders and pos < 0:
-            qty = min(-od.sell_orders[fair_int], -pos)
-            if qty > 0:
-                orders.append(Order(product, fair_int, qty))
-                pos += qty
-        if od.buy_orders and fair_int in od.buy_orders and pos > 0:
-            qty = min(od.buy_orders[fair_int], pos)
-            if qty > 0:
-                orders.append(Order(product, fair_int, -qty))
-                pos -= qty
-
-        # Passive quotes
-        if best_bid is not None and limit - pos > 0:
-            buy_price = best_bid + 1
-            if buy_price < fair:
-                orders.append(Order(product, buy_price, limit - pos))
-            elif best_bid < fair:
-                orders.append(Order(product, best_bid, limit - pos))
-        if best_ask is not None and limit + pos > 0:
-            sell_price = best_ask - 1
-            if sell_price > fair:
-                orders.append(Order(product, sell_price, -(limit + pos)))
-            elif best_ask > fair:
-                orders.append(Order(product, best_ask, -(limit + pos)))
-        return orders
-
-    def trade_velvetfruit(self, state: TradingState) -> List[Order]:
-        product = "VELVETFRUIT_EXTRACT"
-        limit = 200
-        od = state.order_depths.get(product)
-        if not od:
-            return []
-        mid, best_bid, best_ask = self.get_mid(od)
-        if mid is None:
-            return []
-        orders = []
-        pos = state.position.get(product, 0)
-
-        # Take below/above mid
+    def mm(self, state, product, fair, bb, ba, limit):
+        od = state.order_depths[product]
+        orders = []; pos = state.position.get(product, 0)
         if od.sell_orders:
             for price in sorted(od.sell_orders.keys()):
-                if price < mid:
-                    qty = min(-od.sell_orders[price], limit - pos)
-                    if qty > 0:
-                        orders.append(Order(product, price, qty))
-                        pos += qty
+                if price < fair and pos < TAKE_CAP:
+                    qty = min(-od.sell_orders[price], limit-pos, max(TAKE_CAP-pos, 0))
+                    if qty > 0: orders.append(Order(product, price, qty)); pos += qty
         if od.buy_orders:
             for price in sorted(od.buy_orders.keys(), reverse=True):
-                if price > mid:
-                    qty = min(od.buy_orders[price], limit + pos)
-                    if qty > 0:
-                        orders.append(Order(product, price, -qty))
-                        pos -= qty
-
-        # Passive at best±1
-        if best_bid is not None and limit - pos > 0:
-            buy_price = best_bid + 1
-            if buy_price < mid:
-                orders.append(Order(product, buy_price, limit - pos))
-        if best_ask is not None and limit + pos > 0:
-            sell_price = best_ask - 1
-            if sell_price > mid:
-                orders.append(Order(product, sell_price, -(limit + pos)))
-        return orders
-
-    def trade_voucher(self, state: TradingState, product: str, T: float, strike_ivs: Dict[int, float]) -> List[Order]:
-        limit = 300
-        od = state.order_depths.get(product)
-        if not od or product not in VOUCHER_STRIKES:
-            return []
-
-        strike = VOUCHER_STRIKES[product]
-        sigma = strike_ivs.get(strike, 0.23)
-
-        # Get VE underlying
-        ve_od = state.order_depths.get("VELVETFRUIT_EXTRACT")
-        if not ve_od:
-            return []
-        ve_mid, _, _ = self.get_mid(ve_od)
-        if not ve_mid:
-            return []
-        S = ve_mid
-
-        # BS fair price
-        fair = bs_call(S, strike, T, sigma)
-        if fair < 0.5:
-            return []
-
-        orders = []
-        pos = state.position.get(product, 0)
-        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
-        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
-
-        # Take mispriced (buy below fair, sell above fair)
-        if od.sell_orders:
-            for price in sorted(od.sell_orders.keys()):
-                if price < fair - 1:
-                    qty = min(-od.sell_orders[price], limit - pos)
-                    if qty > 0:
-                        orders.append(Order(product, price, qty))
-                        pos += qty
-
-        if od.buy_orders:
-            for price in sorted(od.buy_orders.keys(), reverse=True):
-                if price > fair + 1:
-                    qty = min(od.buy_orders[price], limit + pos)
-                    if qty > 0:
-                        orders.append(Order(product, price, -qty))
-                        pos -= qty
-
-        # Passive quotes around fair
-        fair_int = round(fair)
-        if best_bid is not None and limit - pos > 0:
-            buy_price = min(best_bid + 1, fair_int - 1)
-            if buy_price > 0:
-                orders.append(Order(product, buy_price, limit - pos))
-
-        if best_ask is not None and limit + pos > 0:
-            sell_price = max(best_ask - 1, fair_int + 1)
-            orders.append(Order(product, sell_price, -(limit + pos)))
-
+                if price > fair and pos > -TAKE_CAP:
+                    qty = min(od.buy_orders[price], limit+pos, max(TAKE_CAP+pos, 0))
+                    if qty > 0: orders.append(Order(product, price, -qty)); pos -= qty
+        fi = round(fair)
+        if od.sell_orders and fi in od.sell_orders and pos < 0:
+            qty = min(-od.sell_orders[fi], -pos)
+            if qty > 0: orders.append(Order(product, fi, qty)); pos += qty
+        if od.buy_orders and fi in od.buy_orders and pos > 0:
+            qty = min(od.buy_orders[fi], pos)
+            if qty > 0: orders.append(Order(product, fi, -qty)); pos -= qty
+        if bb is not None and ba is not None and ba-bb >= 2:
+            bp = bb+1; sp = ba-1
+            if ba-bb > 4:
+                if bp <= fair and limit-pos > 0: orders.append(Order(product, bp, limit-pos))
+                if sp >= fair and limit+pos > 0: orders.append(Order(product, sp, -(limit+pos)))
+            else:
+                if limit-pos > 0: orders.append(Order(product, bp, limit-pos))
+                if limit+pos > 0: orders.append(Order(product, sp, -(limit+pos)))
         return orders
 
     def run(self, state: TradingState):
         result = {}
+        td = {}
+        if state.traderData:
+            try: td = json.loads(state.traderData)
+            except: td = {}
 
-        # Infer TTE and volatility smile from current option prices
-        T, strike_ivs = self.infer_tte_and_smile(state)
+        ts = state.timestamp
+        T = max((TTE_DAYS - ts/100/10000)/365, 1e-6)
 
-        # Delta-1 products
+        # ── HP MM ──
         if "HYDROGEL_PACK" in state.order_depths:
-            result["HYDROGEL_PACK"] = self.trade_hydrogel(state)
+            od = state.order_depths["HYDROGEL_PACK"]
+            fair, bb, ba = self.get_wall_mid(od)
+            if fair is not None:
+                result["HYDROGEL_PACK"] = self.mm(state, "HYDROGEL_PACK", fair, bb, ba, HP_LIMIT)
+
+        # ── VE MM (independent) ──
         if "VELVETFRUIT_EXTRACT" in state.order_depths:
-            result["VELVETFRUIT_EXTRACT"] = self.trade_velvetfruit(state)
+            od = state.order_depths["VELVETFRUIT_EXTRACT"]
+            fair, bb, ba = self.get_mid(od)
+            if fair is not None:
+                result["VELVETFRUIT_EXTRACT"] = self.mm(state, "VELVETFRUIT_EXTRACT", fair, bb, ba, VE_LIMIT)
 
-        # Vouchers
-        for product in VOUCHER_STRIKES:
-            if product in state.order_depths:
-                result[product] = self.trade_voucher(state, product, T, strike_ivs)
+        # ── VE mid for BS ──
+        ve_od = state.order_depths.get("VELVETFRUIT_EXTRACT")
+        ve_mid = None
+        if ve_od:
+            ve_mid, _, _ = self.get_mid(ve_od)
 
-        for product in state.order_depths:
-            if product not in result:
-                result[product] = []
+        if ve_mid is None:
+            logger.flush(state, result, 0, json.dumps(td))
+            return result, 0, json.dumps(td)
+
+        # ── Wide option MM (4000, 4500) with take cap ──
+        for strike in [4000]:
+            product = f"VEV_{strike}"
+            od = state.order_depths.get(product)
+            if not od: continue
+            pos = state.position.get(product, 0)
+            fair, bb, ba = self.get_wall_mid(od)
+            if fair is None: continue
+
+            orders = []
+            limit = VEV_LIMIT
+            opt_take_cap = 60
+
+            # Take (capped like HP)
+            if od.sell_orders:
+                for price in sorted(od.sell_orders.keys()):
+                    if price < fair and pos < opt_take_cap:
+                        qty = min(-od.sell_orders[price], limit - pos, max(opt_take_cap - pos, 0))
+                        if qty > 0: orders.append(Order(product, price, qty)); pos += qty
+            if od.buy_orders:
+                for price in sorted(od.buy_orders.keys(), reverse=True):
+                    if price > fair and pos > -opt_take_cap:
+                        qty = min(od.buy_orders[price], limit + pos, max(opt_take_cap + pos, 0))
+                        if qty > 0: orders.append(Order(product, price, -qty)); pos -= qty
+
+            # Flatten at fair
+            fi = round(fair)
+            if od.sell_orders and fi in od.sell_orders and pos < 0:
+                qty = min(-od.sell_orders[fi], -pos)
+                if qty > 0: orders.append(Order(product, fi, qty)); pos += qty
+            if od.buy_orders and fi in od.buy_orders and pos > 0:
+                qty = min(od.buy_orders[fi], pos)
+                if qty > 0: orders.append(Order(product, fi, -qty)); pos -= qty
+
+            # Passive (full size)
+            if bb is not None and ba is not None and ba - bb >= 2:
+                bp = bb + 1; sp = ba - 1
+                if bp <= fair and limit - pos > 0:
+                    orders.append(Order(product, bp, limit - pos))
+                if sp >= fair and limit + pos > 0:
+                    orders.append(Order(product, sp, -(limit + pos)))
+
+            if orders:
+                result[product] = orders
+
+        # ── ATM options: rolling IV signal for directional quoting ──
+        alpha = 2.0 / (IV_WINDOW + 1)
+
+        for strike in [5000, 5100, 5200, 5300, 5400, 5500]:
+            product = f"VEV_{strike}"
+            od = state.order_depths.get(product)
+            if not od: continue
+            mid, bb, ba = self.get_mid(od)
+            if mid is None or bb is None or ba is None: continue
+            spread = ba - bb
+
+            # Compute IV
+            cur_iv = iv_newton(ve_mid, strike, T, mid)
+
+            # Rolling mean IV (EMA)
+            key = f"iv_{strike}"
+            prev = td.get(key, cur_iv)
+            mean_iv = alpha * cur_iv + (1-alpha) * prev
+            td[key] = mean_iv
+
+            # Fair price at rolling mean IV
+            fair_price = bs_call(ve_mid, strike, T, mean_iv)
+
+            pos = state.position.get(product, 0)
+            orders = []
+
+            if spread >= 3:
+                # Can post inside the spread. Use signal to pick side.
+                if cur_iv > mean_iv + 0.002:
+                    # IV above mean: overpriced -> favor selling
+                    sell_qty = min(50, VEV_LIMIT + pos)
+                    if sell_qty > 0:
+                        orders.append(Order(product, ba - 1, -sell_qty))
+                    # Also post buy at bb+1 with smaller size (still MM)
+                    buy_qty = min(10, VEV_LIMIT - pos)
+                    if buy_qty > 0:
+                        orders.append(Order(product, bb + 1, buy_qty))
+
+                elif cur_iv < mean_iv - 0.002:
+                    # IV below mean: underpriced -> favor buying
+                    buy_qty = min(50, VEV_LIMIT - pos)
+                    if buy_qty > 0:
+                        orders.append(Order(product, bb + 1, buy_qty))
+                    sell_qty = min(10, VEV_LIMIT + pos)
+                    if sell_qty > 0:
+                        orders.append(Order(product, ba - 1, -sell_qty))
+
+                else:
+                    # Near mean: balanced MM
+                    buy_qty = min(30, VEV_LIMIT - pos)
+                    sell_qty = min(30, VEV_LIMIT + pos)
+                    if buy_qty > 0:
+                        orders.append(Order(product, bb + 1, buy_qty))
+                    if sell_qty > 0:
+                        orders.append(Order(product, ba - 1, -sell_qty))
+
+            elif spread == 2:
+                # bb+1 = mid = ba-1. Only post when signal is clear.
+                if cur_iv > mean_iv + 0.003:
+                    sell_qty = min(30, VEV_LIMIT + pos)
+                    if sell_qty > 0:
+                        orders.append(Order(product, ba - 1, -sell_qty))
+                elif cur_iv < mean_iv - 0.003:
+                    buy_qty = min(30, VEV_LIMIT - pos)
+                    if buy_qty > 0:
+                        orders.append(Order(product, bb + 1, buy_qty))
+
+            # spread=1: skip
+
+            if orders:
+                result[product] = orders
+
+        # ── LONG STRADDLE: buy calls + sell VE to hedge ──
+        # Profits from VE moving in EITHER direction
+        # Cost: ~600 spread on entry + VE hedge spread
+        # Gamma profit if VE moves 50+pts: +1,000-3,000
+        STRADDLE_CALLS = {5300: 300, 5400: 300, 5200: 17}
+        
+        if ve_mid is not None and ve_od is not None:
+            import math
+            from statistics import NormalDist as _ND
+            _n = _ND()
+            def _bd(S,K,T,s):
+                if T<=1e-6 or s<=0: return 1.0 if S>K else 0.0
+                d1=(math.log(S/K)+0.5*s*s*T)/(s*math.sqrt(T))
+                return _n.cdf(d1)
+            
+            T_val = max((TTE_DAYS - ts/100/10000)/365, 1e-6)
+            
+            # Buy calls gradually
+            for strike, target in STRADDLE_CALLS.items():
+                product = f"VEV_{strike}"
+                od = state.order_depths.get(product)
+                if not od: continue
+                pos = state.position.get(product, 0)
+                remaining = target - pos
+                if remaining > 0 and od.sell_orders:
+                    orders = result.get(product, [])
+                    buy_per_tick = min(20, remaining)
+                    for price in sorted(od.sell_orders.keys()):
+                        if buy_per_tick <= 0: break
+                        qty = min(-od.sell_orders[price], buy_per_tick, VEV_LIMIT - pos)
+                        if qty > 0:
+                            orders.append(Order(product, price, qty))
+                            buy_per_tick -= qty; pos += qty
+                    if orders: result[product] = orders
+
+            # Delta hedge: sell VE to offset call delta
+            agg_delta = 0
+            for strike in list(STRADDLE_CALLS.keys()) + [4000]:
+                product = f"VEV_{strike}"
+                opt_pos = state.position.get(product, 0)
+                if opt_pos != 0:
+                    agg_delta += opt_pos * _bd(ve_mid, strike, T_val, 0.265)
+
+            target_ve = max(-VE_LIMIT, min(VE_LIMIT, round(-agg_delta)))
+            ve_pos = state.position.get("VELVETFRUIT_EXTRACT", 0)
+            ve_needed = target_ve - ve_pos
+
+            # Only rebalance when off by 25+ (reduce hedge cost)
+            if abs(ve_needed) > 25:
+                ve_orders = []
+                if ve_needed > 0 and ve_od.sell_orders:
+                    left = ve_needed
+                    for price in sorted(ve_od.sell_orders.keys()):
+                        if left <= 0: break
+                        qty = min(-ve_od.sell_orders[price], left, VE_LIMIT - ve_pos)
+                        if qty > 0:
+                            ve_orders.append(Order("VELVETFRUIT_EXTRACT", price, qty))
+                            ve_pos += qty; left -= qty
+                elif ve_needed < 0 and ve_od.buy_orders:
+                    left = -ve_needed
+                    for price in sorted(ve_od.buy_orders.keys(), reverse=True):
+                        if left <= 0: break
+                        qty = min(ve_od.buy_orders[price], left, VE_LIMIT + ve_pos)
+                        if qty > 0:
+                            ve_orders.append(Order("VELVETFRUIT_EXTRACT", price, -qty))
+                            ve_pos -= qty; left -= qty
+                if ve_orders:
+                    result["VELVETFRUIT_EXTRACT"] = ve_orders
 
         conversions = 0
-        trader_data = ""
+        try: trader_data = json.dumps(td)
+        except: trader_data = ""
         logger.flush(state, result, conversions, trader_data)
         return result, conversions, trader_data

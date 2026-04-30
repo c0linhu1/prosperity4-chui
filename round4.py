@@ -60,12 +60,12 @@ FIXED_IV = 0.211
 # ATM strikes with decent spread: uncapped (300)
 # Deep ITM or tight spread: conservative (100)
 STRIKE_CAPS = {
-    5000: 100,
-    5100: VEV_LIMIT,  # 300 - uncapped
-    5200: VEV_LIMIT,  # 300 - main alpha
-    5300: VEV_LIMIT,  # 300 - main alpha
-    5400: VEV_LIMIT,  # 300 - uncapped
-    5500: 100,
+    5000: VEV_LIMIT,  # 300 - all uncapped
+    5100: VEV_LIMIT,  # 300
+    5200: VEV_LIMIT,  # 300
+    5300: VEV_LIMIT,  # 300
+    5400: VEV_LIMIT,  # 300
+    5500: VEV_LIMIT,  # 300
 }
 
 def bs_call(S, K, T, sig):
@@ -164,7 +164,7 @@ class Trader:
             if ve_ba - ve_bb >= 2:
                 bp = ve_bb + 1; sp = ve_ba - 1
                 sell_size = max(0, VE_LIMIT + pos_ve)
-                buy_size = max(0, min(40, VE_LIMIT - pos_ve))  # cap buys at 40
+                buy_size = 0  # no buys, max short bias
 
                 if ve_ba - ve_bb > 4:
                     if bp <= fair and buy_size > 0:
@@ -208,14 +208,14 @@ class Trader:
 
                 # Take mispriced: buy when cheap, sell when expensive
                 for price in sorted(od.sell_orders.keys()):
-                    if price < bs_fair - 1 and pos < cap:
+                    if price < bs_fair - 0.5 and pos < cap:
                         qty = min(-od.sell_orders[price], cap - pos, 50)
                         if qty > 0:
                             orders.append(Order(product, price, qty))
                             pos += qty
 
                 for price in sorted(od.buy_orders.keys(), reverse=True):
-                    if price > bs_fair + 1 and pos > -cap:
+                    if price > bs_fair + 0.5 and pos > -cap:
                         qty = min(od.buy_orders[price], cap + pos, 50)
                         if qty > 0:
                             orders.append(Order(product, price, -qty))
